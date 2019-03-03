@@ -1,176 +1,368 @@
+// Copyright 2017 The Walk Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package main
 
 import (
-	"fmt"
-	"sort"
+	"bytes"
 )
 
 import (
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
-	"github.com/sudomabider/scoop-ui/scoop"
 )
 
-type App struct {
-	*scoop.App
-
-	Index   int
-	checked bool
+type MultiPageMainWindowConfig struct {
+	Name                 string
+	Enabled              Property
+	Visible              Property
+	Font                 Font
+	MinSize              Size
+	MaxSize              Size
+	ContextMenuItems     []MenuItem
+	OnKeyDown            walk.KeyEventHandler
+	OnKeyPress           walk.KeyEventHandler
+	OnKeyUp              walk.KeyEventHandler
+	OnMouseDown          walk.MouseEventHandler
+	OnMouseMove          walk.MouseEventHandler
+	OnMouseUp            walk.MouseEventHandler
+	OnSizeChanged        walk.EventHandler
+	OnCurrentPageChanged walk.EventHandler
+	Title                string
+	Size                 Size
+	MenuItems            []MenuItem
+	ToolBar              ToolBar
+	PageCfgs             []PageConfig
 }
 
-type AppModel struct {
-	walk.TableModelBase
-	walk.SorterBase
-	sortColumn int
-	sortOrder  walk.SortOrder
-	items      []*App
+type PageConfig struct {
+	Title   string
+	Image   string
+	NewPage PageFactoryFunc
 }
 
-func NewAppModel() *AppModel {
-	m := new(AppModel)
-	m.ResetRows()
-	return m
+type PageFactoryFunc func(parent walk.Container) (Page, error)
+
+type Page interface {
+	// Provided by Walk
+	walk.Container
+	Parent() walk.Container
+	SetParent(parent walk.Container) error
 }
 
-// RowCount is called by the TableView from SetModel and every time the model publishes a
-// RowsReset event.
-func (m *AppModel) RowCount() int {
-	return len(m.items)
+type MultiPageMainWindow struct {
+	*walk.MainWindow
+	navTB                       *walk.ToolBar
+	pageCom                     *walk.Composite
+	action2NewPage              map[*walk.Action]PageFactoryFunc
+	pageActions                 []*walk.Action
+	currentAction               *walk.Action
+	currentPage                 Page
+	currentPageChangedPublisher walk.EventPublisher
 }
 
-// Value is called by the TableView when it needs the text to display for a given cell.
-func (m *AppModel) Value(row, col int) interface{} {
-	item := m.items[row]
-
-	switch col {
-	case 0:
-		return item.Index
-
-	case 1:
-		return item.Name
-
-	case 2:
-		return item.Version
-
-	case 3:
-		return item.Bucket
+func NewMultiPageMainWindow(cfg *MultiPageMainWindowConfig) (*MultiPageMainWindow, error) {
+	mpmw := &MultiPageMainWindow{
+		action2NewPage: make(map[*walk.Action]PageFactoryFunc),
 	}
 
-	panic("unexpected col")
+	if err := (MainWindow{
+		AssignTo:         &mpmw.MainWindow,
+		Name:             cfg.Name,
+		Title:            cfg.Title,
+		Enabled:          cfg.Enabled,
+		Visible:          cfg.Visible,
+		Font:             cfg.Font,
+		MinSize:          cfg.MinSize,
+		MaxSize:          cfg.MaxSize,
+		MenuItems:        cfg.MenuItems,
+		ToolBar:          cfg.ToolBar,
+		ContextMenuItems: cfg.ContextMenuItems,
+		OnKeyDown:        cfg.OnKeyDown,
+		OnKeyPress:       cfg.OnKeyPress,
+		OnKeyUp:          cfg.OnKeyUp,
+		OnMouseDown:      cfg.OnMouseDown,
+		OnMouseMove:      cfg.OnMouseMove,
+		OnMouseUp:        cfg.OnMouseUp,
+		OnSizeChanged:    cfg.OnSizeChanged,
+		Layout:           HBox{MarginsZero: true, SpacingZero: true},
+		Children: []Widget{
+			ScrollView{
+				HorizontalFixed: true,
+				Layout:          VBox{MarginsZero: true},
+				Children: []Widget{
+					Composite{
+						Layout: VBox{MarginsZero: true},
+						Children: []Widget{
+							ToolBar{
+								AssignTo:    &mpmw.navTB,
+								Orientation: Vertical,
+								ButtonStyle: ToolBarButtonImageAboveText,
+								MaxTextRows: 2,
+							},
+						},
+					},
+				},
+			},
+			Composite{
+				AssignTo: &mpmw.pageCom,
+				Name:     "pageCom",
+				Layout:   HBox{MarginsZero: true, SpacingZero: true},
+			},
+		},
+	}).Create(); err != nil {
+		return nil, err
+	}
+
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			mpmw.Dispose()
+		}
+	}()
+
+	for _, pc := range cfg.PageCfgs {
+		action, err := mpmw.newPageAction(pc.Title, pc.NewPage)
+		if err != nil {
+			return nil, err
+		}
+
+		mpmw.pageActions = append(mpmw.pageActions, action)
+	}
+
+	if err := mpmw.updateNavigationToolBar(); err != nil {
+		return nil, err
+	}
+
+	if len(mpmw.pageActions) > 0 {
+		if err := mpmw.setCurrentAction(mpmw.pageActions[0]); err != nil {
+			return nil, err
+		}
+	}
+
+	if cfg.OnCurrentPageChanged != nil {
+		mpmw.CurrentPageChanged().Attach(cfg.OnCurrentPageChanged)
+	}
+
+	succeeded = true
+
+	return mpmw, nil
 }
 
-// Called by the TableView to retrieve if a given row is checked.
-func (m *AppModel) Checked(row int) bool {
-	return m.items[row].checked
+func (mpmw *MultiPageMainWindow) CurrentPage() Page {
+	return mpmw.currentPage
 }
 
-// Called by the TableView when the user toggled the check box of a given row.
-func (m *AppModel) SetChecked(row int, checked bool) error {
-	m.items[row].checked = checked
+func (mpmw *MultiPageMainWindow) CurrentPageTitle() string {
+	if mpmw.currentAction == nil {
+		return ""
+	}
+
+	return mpmw.currentAction.Text()
+}
+
+func (mpmw *MultiPageMainWindow) CurrentPageChanged() *walk.Event {
+	return mpmw.currentPageChangedPublisher.Event()
+}
+
+func (mpmw *MultiPageMainWindow) newPageAction(title string, newPage PageFactoryFunc) (*walk.Action, error) {
+	action := walk.NewAction()
+	action.SetCheckable(true)
+	action.SetExclusive(true)
+	action.SetText(title)
+
+	mpmw.action2NewPage[action] = newPage
+
+	action.Triggered().Attach(func() {
+		mpmw.setCurrentAction(action)
+	})
+
+	return action, nil
+}
+
+func (mpmw *MultiPageMainWindow) setCurrentAction(action *walk.Action) error {
+	defer func() {
+		if !mpmw.pageCom.IsDisposed() {
+			mpmw.pageCom.RestoreState()
+			mpmw.pageCom.Layout().Update(false)
+		}
+	}()
+
+	mpmw.SetFocus()
+
+	if prevPage := mpmw.currentPage; prevPage != nil {
+		mpmw.pageCom.SaveState()
+		prevPage.SetVisible(false)
+		prevPage.(walk.Widget).SetParent(nil)
+		prevPage.Dispose()
+	}
+
+	newPage := mpmw.action2NewPage[action]
+
+	page, err := newPage(mpmw.pageCom)
+	if err != nil {
+		return err
+	}
+
+	action.SetChecked(true)
+
+	mpmw.currentPage = page
+	mpmw.currentAction = action
+
+	mpmw.currentPageChangedPublisher.Publish()
 
 	return nil
 }
 
-// Called by the TableView to sort the model.
-func (m *AppModel) Sort(col int, order walk.SortOrder) error {
-	m.sortColumn, m.sortOrder = col, order
+func (mpmw *MultiPageMainWindow) updateNavigationToolBar() error {
+	mpmw.navTB.SetSuspended(true)
+	defer mpmw.navTB.SetSuspended(false)
 
-	sort.SliceStable(m.items, func(i, j int) bool {
-		a, b := m.items[i], m.items[j]
+	actions := mpmw.navTB.Actions()
 
-		c := func(ls bool) bool {
-			if m.sortOrder == walk.SortAscending {
-				return ls
-			}
+	if err := actions.Clear(); err != nil {
+		return err
+	}
 
-			return !ls
-		}
-
-		switch m.sortColumn {
-		case 0:
-			return c(a.Index < b.Index)
-
-		case 1:
-			return c(a.Name < b.Name)
-
-		case 2:
-			return c(a.Version < b.Version)
-
-		case 3:
-			return c(a.Bucket < b.Bucket)
-		}
-
-		panic("unreachable")
-	})
-
-	return m.SorterBase.Sort(col, order)
-}
-
-func (m *AppModel) ResetRows() {
-	apps, _ := scoop.List()
-
-	m.items = make([]*App, len(apps))
-
-	for i := range m.items {
-		m.items[i] = &App{
-			App:   &apps[i],
-			Index: i,
+	for _, action := range mpmw.pageActions {
+		if err := actions.Add(action); err != nil {
+			return err
 		}
 	}
 
-	m.PublishRowsReset()
+	if mpmw.currentAction != nil {
+		if !actions.Contains(mpmw.currentAction) {
+			for _, action := range mpmw.pageActions {
+				if action != mpmw.currentAction {
+					if err := mpmw.setCurrentAction(action); err != nil {
+						return err
+					}
 
-	m.Sort(m.sortColumn, m.sortOrder)
+					break
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func main() {
-	model := NewAppModel()
+	walk.Resources.SetRootDirPath("../img")
 
-	var tv *walk.TableView
+	mw := new(AppMainWindow)
 
-	MainWindow{
-		Title:  "Walk TableView Example",
-		Size:   Size{Width: 800, Height: 600},
-		Layout: VBox{MarginsZero: true},
-		Children: []Widget{
-			PushButton{
-				Text:      "Reset Rows",
-				OnClicked: model.ResetRows,
-			},
-			PushButton{
-				Text: "Select first 5 even Rows",
-				OnClicked: func() {
-					tv.SetSelectedIndexes([]int{0, 2, 4, 6, 8})
-				},
-			},
-			TableView{
-				AssignTo:              &tv,
-				AlternatingRowBGColor: walk.RGB(239, 239, 239),
-				CheckBoxes:            true,
-				ColumnsOrderable:      true,
-				MultiSelection:        true,
-				Columns: []TableViewColumn{
-					{Title: "#"},
-					{Title: "Name"},
-					{Title: "Version"},
-					{Title: "Bucket", Alignment: AlignFar},
-				},
-				StyleCell: func(style *walk.CellStyle) {
-					item := model.items[style.Row()]
-
-					if item.checked {
-						if style.Row()%2 == 0 {
-							style.BackgroundColor = walk.RGB(159, 215, 255)
-						} else {
-							style.BackgroundColor = walk.RGB(143, 199, 239)
-						}
-					}
-				},
-				Model: model,
-				OnSelectedIndexesChanged: func() {
-					fmt.Printf("SelectedIndexes: %v\n", tv.SelectedIndexes())
+	cfg := &MultiPageMainWindowConfig{
+		Name:    "mainWindow",
+		MinSize: Size{600, 400},
+		MenuItems: []MenuItem{
+			Menu{
+				Text: "&Help",
+				Items: []MenuItem{
+					Action{
+						Text:        "About",
+						OnTriggered: func() { mw.aboutAction_Triggered() },
+					},
 				},
 			},
 		},
-	}.Run()
+		OnCurrentPageChanged: func() {
+			mw.updateTitle(mw.CurrentPageTitle())
+		},
+		PageCfgs: []PageConfig{
+			{"Apps", "document-new.png", newListPage},
+			{"Bar", "document-properties.png", newBarPage},
+			{"Baz", "system-shutdown.png", newBazPage},
+		},
+	}
+
+	mpmw, err := NewMultiPageMainWindow(cfg)
+	if err != nil {
+		panic(err)
+	}
+
+	mw.MultiPageMainWindow = mpmw
+
+	mw.updateTitle(mw.CurrentPageTitle())
+
+	mw.Run()
+}
+
+type AppMainWindow struct {
+	*MultiPageMainWindow
+}
+
+func (mw *AppMainWindow) updateTitle(prefix string) {
+	var buf bytes.Buffer
+
+	if prefix != "" {
+		buf.WriteString(prefix)
+		buf.WriteString(" - ")
+	}
+
+	buf.WriteString("Walk Multiple Pages Example")
+
+	mw.SetTitle(buf.String())
+}
+
+func (mw *AppMainWindow) aboutAction_Triggered() {
+	walk.MsgBox(mw,
+		"About Walk Multiple Pages Example",
+		"An example that demonstrates a main window that supports multiple pages.",
+		walk.MsgBoxOK|walk.MsgBoxIconInformation)
+}
+
+type BarPage struct {
+	*walk.Composite
+}
+
+func newBarPage(parent walk.Container) (Page, error) {
+	p := new(BarPage)
+
+	if err := (Composite{
+		AssignTo: &p.Composite,
+		Name:     "barPage",
+		Layout:   HBox{},
+		Children: []Widget{
+			HSpacer{},
+			Label{Text: "I'm the Bar page"},
+			HSpacer{},
+		},
+	}).Create(NewBuilder(parent)); err != nil {
+		return nil, err
+	}
+
+	if err := walk.InitWrapperWindow(p); err != nil {
+		return nil, err
+	}
+
+	return p, nil
+}
+
+type BazPage struct {
+	*walk.Composite
+}
+
+func newBazPage(parent walk.Container) (Page, error) {
+	p := new(BazPage)
+
+	if err := (Composite{
+		AssignTo: &p.Composite,
+		Name:     "bazPage",
+		Layout:   HBox{},
+		Children: []Widget{
+			HSpacer{},
+			Label{Text: "I'm the Baz page"},
+			HSpacer{},
+		},
+	}).Create(NewBuilder(parent)); err != nil {
+		return nil, err
+	}
+
+	if err := walk.InitWrapperWindow(p); err != nil {
+		return nil, err
+	}
+
+	return p, nil
 }
